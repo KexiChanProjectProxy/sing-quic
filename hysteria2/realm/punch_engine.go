@@ -26,16 +26,17 @@ type PunchResult struct {
 	Type     byte
 }
 
-func Punch(ctx context.Context, conn net.PacketConn, peerAddresses []netip.AddrPort, metadata PunchMetadata) (PunchResult, error) {
+func Punch(ctx context.Context, conn net.PacketConn, peerAddresses []netip.AddrPort, metadata PunchMetadata, options PunchOptions) (PunchResult, error) {
 	candidates := candidatePunchAddrs(peerAddresses)
 	if len(candidates) == 0 {
 		return PunchResult{}, E.New("no compatible peer addresses")
 	}
-
-	ctx, cancel := context.WithTimeout(ctx, punchTimeout)
+	timeout, fallback := options.Timing()
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	defer conn.SetReadDeadline(time.Time{})
 
+	sched := newPunchSchedule(candidates, fallback, time.Now(), options.Prefer)
 	nextSend := time.Now()
 	buffer := make([]byte, saltLength+minBodySize+maxPadding)
 	for {
@@ -45,7 +46,7 @@ func Punch(ctx context.Context, conn net.PacketConn, peerAddresses []netip.AddrP
 		}
 		now := time.Now()
 		if !now.Before(nextSend) {
-			sendPunchPackets(conn, candidates, PunchHello, metadata)
+			sendPunchPackets(conn, sched.addrs(now), PunchHello, metadata)
 			nextSend = now.Add(punchInterval)
 		}
 		deadline := nextSend
@@ -116,7 +117,7 @@ func (p *ServerPuncher) dispatch(ctx context.Context) {
 	}
 }
 
-func (p *ServerPuncher) Respond(ctx context.Context, attemptID string, peerAddresses []netip.AddrPort, metadata PunchMetadata) (PunchResult, error) {
+func (p *ServerPuncher) Respond(ctx context.Context, attemptID string, peerAddresses []netip.AddrPort, metadata PunchMetadata, options PunchOptions) (PunchResult, error) {
 	candidates := candidatePunchAddrs(peerAddresses)
 	if len(candidates) == 0 {
 		return PunchResult{}, E.New("no compatible peer addresses")
@@ -132,11 +133,13 @@ func (p *ServerPuncher) Respond(ctx context.Context, attemptID string, peerAddre
 		p.access.Unlock()
 		p.conn.RemoveAttempt(attemptID)
 	}()
-	ctx, cancel := context.WithTimeout(ctx, punchTimeout)
+	timeout, fallback := options.Timing()
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	sched := newPunchSchedule(candidates, fallback, time.Now(), options.Prefer)
 	ticker := time.NewTicker(punchInterval)
 	defer ticker.Stop()
-	sendPunchPackets(p.conn, candidates, PunchHello, metadata)
+	sendPunchPackets(p.conn, sched.addrs(time.Now()), PunchHello, metadata)
 	for {
 		select {
 		case event := <-eventCh:
@@ -145,7 +148,7 @@ func (p *ServerPuncher) Respond(ctx context.Context, attemptID string, peerAddre
 			}
 			return PunchResult{PeerAddr: event.From, Type: event.Type}, nil
 		case <-ticker.C:
-			sendPunchPackets(p.conn, candidates, PunchHello, metadata)
+			sendPunchPackets(p.conn, sched.addrs(time.Now()), PunchHello, metadata)
 		case <-ctx.Done():
 			return PunchResult{}, E.Cause(ctx.Err(), "punch respond timeout")
 		}
@@ -237,4 +240,45 @@ func predictablePortGroup(ports []uint16) bool {
 		}
 	}
 	return true
+}
+
+type punchSchedule struct {
+	first, rest []netip.AddrPort
+	until       time.Time
+}
+
+func newPunchSchedule(candidates []netip.AddrPort, fallback time.Duration, now time.Time, prefer PreferIPVersion) punchSchedule {
+	var v6, v4 []netip.AddrPort
+	for _, addr := range candidates {
+		if addr.Addr().Is4() || addr.Addr().Is4In6() {
+			v4 = append(v4, addr)
+		} else if addr.Addr().Is6() {
+			v6 = append(v6, addr)
+		}
+	}
+	var first, rest []netip.AddrPort
+	switch prefer {
+	case PreferIPVersion4:
+		first, rest = v4, v6
+	case PreferIPVersionBoth:
+		first = append(append([]netip.AddrPort(nil), v6...), v4...)
+	default:
+		first, rest = v6, v4
+	}
+	s := punchSchedule{first: first, rest: rest}
+	if len(first) > 0 && len(rest) > 0 {
+		s.until = now.Add(fallback)
+	}
+	return s
+}
+
+func (s punchSchedule) addrs(now time.Time) []netip.AddrPort {
+	if len(s.first) == 0 {
+		return s.rest
+	}
+	if len(s.rest) == 0 || (!s.until.IsZero() && now.Before(s.until)) {
+		return s.first
+	}
+	out := make([]netip.AddrPort, 0, len(s.first)+len(s.rest))
+	return append(append(out, s.first...), s.rest...)
 }

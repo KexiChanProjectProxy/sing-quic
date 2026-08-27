@@ -407,35 +407,52 @@ func (c *Client) realmOpenFamilies(ctx context.Context) ([]*realmFamilyConn, err
 	case 6:
 		specs = specs[1:]
 	}
-	conns := make([]*realmFamilyConn, len(specs))
-	listenErrs := make([]error, len(specs))
-	var wg sync.WaitGroup
-	for i, spec := range specs {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			conn, listenErr := c.dialer.ListenPacket(ctx, spec.addr)
-			if listenErr != nil {
-				listenErrs[i] = E.Cause(listenErr, spec.family)
-				return
-			}
-			conns[i] = &realmFamilyConn{family: spec.family, ipv4: spec.ipv4, conn: conn}
-		}()
+	ports := c.realmOptions.ListenPorts
+	if len(ports) == 0 {
+		ports = []uint16{0}
+	} else {
+		ports = realm.ShuffleListenPorts(ports)
 	}
-	wg.Wait()
-	var families []*realmFamilyConn
-	var errs []error
-	for i, family := range conns {
-		if family != nil {
-			families = append(families, family)
-			continue
+	var firstErr error
+	for _, port := range ports {
+		conns := make([]*realmFamilyConn, len(specs))
+		listenErrs := make([]error, len(specs))
+		var wg sync.WaitGroup
+		for i, spec := range specs {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				addr := spec.addr
+				addr.Port = port
+				conn, listenErr := c.dialer.ListenPacket(ctx, addr)
+				if listenErr != nil {
+					listenErrs[i] = E.Cause(listenErr, spec.family)
+					return
+				}
+				conns[i] = &realmFamilyConn{family: spec.family, ipv4: spec.ipv4, conn: conn}
+			}()
 		}
-		errs = append(errs, listenErrs[i])
+		wg.Wait()
+		var families []*realmFamilyConn
+		var errs []error
+		for i, family := range conns {
+			if family != nil {
+				families = append(families, family)
+				continue
+			}
+			errs = append(errs, listenErrs[i])
+		}
+		if len(families) > 0 {
+			return families, nil
+		}
+		if firstErr == nil {
+			firstErr = E.Errors(errs...)
+		}
+		if port == 0 {
+			break
+		}
 	}
-	if len(families) == 0 {
-		return nil, E.Cause(E.Errors(errs...), "listen UDP for realm")
-	}
-	return families, nil
+	return nil, E.Cause(firstErr, "listen UDP for realm")
 }
 
 func (c *Client) realmDiscoverFamilies(ctx context.Context, families []*realmFamilyConn) ([]*realmFamilyConn, []netip.AddrPort, error) {
@@ -475,22 +492,68 @@ func (c *Client) realmDiscoverFamilies(ctx context.Context, families []*realmFam
 		}()
 	}
 	wg.Wait()
+	stunOK := false
+	for _, result := range results {
+		if result.err == nil && len(result.addrs) > 0 {
+			stunOK = true
+			break
+		}
+	}
+	if !stunOK {
+		var errs []error
+		for i, family := range families {
+			if results[i].err != nil {
+				errs = append(errs, E.Cause(results[i].err, family.family))
+			}
+			_ = family.conn.Close()
+		}
+		return nil, nil, E.Cause(E.Errors(errs...), "realm STUN discovery")
+	}
 	var surviving []*realmFamilyConn
 	var union []netip.AddrPort
-	var errs []error
 	for i, family := range families {
 		result := results[i]
 		if result.err != nil {
-			errs = append(errs, E.Cause(result.err, family.family))
-			_ = family.conn.Close()
 			continue
 		}
 		family.localAddresses = result.addrs
 		surviving = append(surviving, family)
 		union = append(union, result.addrs...)
 	}
+	if c.realmOptions.IPv6API != "" && c.realmOptions.IPVersion != 4 {
+		for i, family := range families {
+			if family.ipv4 {
+				if results[i].err != nil {
+					_ = family.conn.Close()
+				}
+				continue
+			}
+			port := realm.PacketConnPort(family.conn.LocalAddr())
+			extra := realm.SupplementIPv6(ctx, nil, c.realmOptions.IPv6API, port, c.logger)
+			if len(extra) == 0 {
+				if results[i].err != nil {
+					_ = family.conn.Close()
+				}
+				break
+			}
+			if results[i].err != nil {
+				family.localAddresses = extra
+				surviving = append(surviving, family)
+			} else {
+				family.localAddresses = realm.InsertAddrPorts(family.localAddresses, extra)
+			}
+			union = realm.InsertAddrPorts(union, extra)
+			break
+		}
+	} else {
+		for i, family := range families {
+			if results[i].err != nil {
+				_ = family.conn.Close()
+			}
+		}
+	}
 	if len(surviving) == 0 {
-		return nil, nil, E.Cause(E.Errors(errs...), "realm STUN discovery")
+		return nil, nil, E.New("realm STUN discovery: no addresses")
 	}
 	return surviving, union, nil
 }
@@ -501,28 +564,91 @@ func (c *Client) realmRacePunch(
 	peerAddresses []netip.AddrPort,
 	metadata realm.PunchMetadata,
 ) (*realmFamilyConn, realm.PunchResult, error) {
-	raceCtx, raceCancel := context.WithCancel(ctx)
+	punchOpts := realm.PunchOptions{
+		FallbackTimeout: c.realmOptions.FallbackTimeout,
+		Prefer:          c.realmOptions.PreferIPVersion,
+	}
+	timeout, fallback := punchOpts.Timing()
+	raceCtx, raceCancel := context.WithTimeout(ctx, timeout)
 	defer raceCancel()
 	type outcome struct {
 		family *realmFamilyConn
 		result realm.PunchResult
 		err    error
 	}
-	out := make(chan outcome, len(families))
+	type job struct {
+		family *realmFamilyConn
+		delay  time.Duration
+	}
+	var v4, v6 *realmFamilyConn
 	for _, family := range families {
+		if family.ipv4 {
+			v4 = family
+		} else {
+			v6 = family
+		}
+	}
+	peersOf := func(ipv4 bool) []netip.AddrPort {
+		var peers []netip.AddrPort
+		for _, peer := range peerAddresses {
+			if peer.Addr().Is4() == ipv4 || peer.Addr().Is4In6() == ipv4 {
+				peers = append(peers, peer)
+			}
+		}
+		return peers
+	}
+	var jobs []job
+	switch punchOpts.Prefer {
+	case realm.PreferIPVersion4:
+		if v4 != nil {
+			jobs = append(jobs, job{v4, 0})
+		}
+		if v6 != nil {
+			delay := fallback
+			if v4 == nil || len(peersOf(true)) == 0 {
+				delay = 0
+			}
+			jobs = append(jobs, job{v6, delay})
+		}
+	case realm.PreferIPVersionBoth:
+		if v6 != nil {
+			jobs = append(jobs, job{v6, 0})
+		}
+		if v4 != nil {
+			jobs = append(jobs, job{v4, 0})
+		}
+	default:
+		if v6 != nil {
+			jobs = append(jobs, job{v6, 0})
+		}
+		if v4 != nil {
+			delay := fallback
+			if v6 == nil || len(peersOf(false)) == 0 {
+				delay = 0
+			}
+			jobs = append(jobs, job{v4, delay})
+		}
+	}
+	out := make(chan outcome, len(jobs))
+	for _, item := range jobs {
 		go func() {
-			peers := make([]netip.AddrPort, 0, len(peerAddresses))
-			for _, peer := range peerAddresses {
-				if peer.Addr().Is4() == family.ipv4 {
-					peers = append(peers, peer)
+			if item.delay > 0 {
+				timer := time.NewTimer(item.delay)
+				select {
+				case <-raceCtx.Done():
+					timer.Stop()
+					out <- outcome{family: item.family, err: raceCtx.Err()}
+					return
+				case <-timer.C:
 				}
 			}
-			punchResult, punchErr := realm.Punch(raceCtx, family.conn, peers, metadata)
-			out <- outcome{family: family, result: punchResult, err: punchErr}
+			peers := peersOf(item.family.ipv4)
+			punchResult, punchErr := realm.Punch(raceCtx, item.family.conn, peers, metadata, punchOpts)
+			out <- outcome{family: item.family, result: punchResult, err: punchErr}
 		}()
 	}
 	var errs []error
-	for pending := len(families); pending > 0; pending-- {
+	for pending := len(jobs); pending > 0; pending-- {
 		result := <-out
 		if result.err == nil {
 			for _, family := range families {
