@@ -29,15 +29,19 @@ const (
 type Resolver func(ctx context.Context, host string, ipv4, ipv6 bool) ([]netip.Addr, error)
 
 type Options struct {
-	ServerURL   string
-	Token       string
-	HTTPClient  *http.Client
-	RealmID     string
-	STUNServers []string
-	Resolver    Resolver
-	Logger      logger.Logger
-	IPVersion   int
-	PortMapping *PortMappingOptions
+	ServerURL       string
+	Token           string
+	HTTPClient      *http.Client
+	RealmID         string
+	STUNServers     []string
+	Resolver        Resolver
+	Logger          logger.Logger
+	IPVersion       int
+	PreferIPVersion PreferIPVersion
+	FallbackTimeout time.Duration
+	IPv6API         string
+	ListenPorts     []uint16
+	PortMapping     *PortMappingOptions
 }
 
 type Server struct {
@@ -83,6 +87,9 @@ func NewServer(options Options) (*Server, error) {
 	}
 	if options.IPVersion == 6 && options.PortMapping != nil {
 		return nil, E.New("port mapping requires IPv4")
+	}
+	if _, err := NormalizeIPv6LookupURL(options.IPv6API); err != nil {
+		return nil, err
 	}
 	return &Server{
 		options:       options,
@@ -262,7 +269,7 @@ func (s *Server) readEvents(ctx context.Context, stream *EventStream, streamDone
 					s.options.Logger.Warn(E.Cause(postErr, "connect response post"))
 				}
 			}
-			result, punchErr := s.puncher.Respond(ctx, generateAttemptID(), peerAddresses, metadata)
+			result, punchErr := s.puncher.Respond(ctx, generateAttemptID(), peerAddresses, metadata, s.punchOptions())
 			if punchErr != nil {
 				if !E.IsClosedOrCanceled(punchErr) {
 					s.options.Logger.Error(E.Cause(punchErr, "punch respond"))
@@ -325,6 +332,9 @@ func (s *Server) connectAddresses(ctx context.Context) ([]netip.AddrPort, error)
 		fresh, discoverErr := DiscoverDemuxed(ctx, s.punchConn, servers)
 		if discoverErr != nil {
 			return nil, discoverErr
+		}
+		if s.options.IPVersion != 4 {
+			fresh = SupplementIPv6(ctx, fresh, s.options.IPv6API, PacketConnPort(s.punchConn.LocalAddr()), s.options.Logger)
 		}
 		s.addressAccess.Lock()
 		s.addresses = slices.Clone(fresh)
@@ -439,4 +449,11 @@ func generateAttemptID() string {
 	var buffer [8]byte
 	_, _ = rand.Read(buffer[:])
 	return hex.EncodeToString(buffer[:])
+}
+
+func (s *Server) punchOptions() PunchOptions {
+	return PunchOptions{
+		FallbackTimeout: s.options.FallbackTimeout,
+		Prefer:          s.options.PreferIPVersion,
+	}
 }
