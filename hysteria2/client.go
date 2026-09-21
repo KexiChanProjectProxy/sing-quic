@@ -11,9 +11,11 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
 	qtls "github.com/sagernet/sing-quic"
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
@@ -80,6 +82,12 @@ type Client struct {
 	connAccess sync.Mutex
 	conn       *clientQUICConnection
 	pending    *clientOffer
+
+	// statsRequested makes new connections ask the server for its view of the
+	// connection. It is off unless a caller wants server statistics, so that a
+	// client that never reads them sends nothing new on the wire.
+	statsRequested atomic.Bool
+	connectionID   atomic.Uint64
 }
 
 func NewClient(options ClientOptions) (*Client, error) {
@@ -683,6 +691,9 @@ func (c *Client) authenticateAndWrap(ctx context.Context, rawConn io.Closer, cre
 		Header: make(http.Header),
 	}
 	protocol.AuthRequestToHeader(request.Header, protocol.AuthRequest{Auth: c.password, Rx: c.receiveBPS})
+	if c.statsRequested.Load() {
+		protocol.SetStatsRequested(request.Header)
+	}
 	handshakeTimeout := c.tlsConfig.HandshakeTimeout()
 	if handshakeTimeout <= 0 {
 		handshakeTimeout = defaultHandshakeTimeout
@@ -710,20 +721,27 @@ func (c *Client) authenticateAndWrap(ctx context.Context, rawConn io.Closer, cre
 	if actualTx == 0 || actualTx > c.sendBPS {
 		actualTx = c.sendBPS
 	}
+	var congestionControl congestion.CongestionControl
 	if !authResponse.RxAuto && actualTx > 0 {
-		quicConn.SetCongestionControl(hyCC.NewBrutalSender(actualTx, quicConn.InitialPacketSize(), c.brutalDebug, c.logger))
+		congestionControl = hyCC.NewBrutalSender(actualTx, quicConn.InitialPacketSize(), c.brutalDebug, c.logger)
 	} else {
-		quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
+		congestionControl = congestion_meta2.NewBbrSenderWithProfile(
 			quicConn.InitialPacketSize(),
 			c.bbrProfile,
-		))
+		)
 	}
+	congestionControl, losses := countLosses(congestionControl)
+	quicConn.SetCongestionControl(congestionControl)
 	conn := &clientQUICConnection{
-		quicConn:    quicConn,
-		rawConn:     rawConn,
-		connDone:    make(chan struct{}),
-		udpDisabled: !authResponse.UDPEnabled,
-		udpConnMap:  make(map[uint32]*udpPacketConn),
+		id:             c.connectionID.Add(1),
+		quicConn:       quicConn,
+		rawConn:        rawConn,
+		http3Transport: http3Transport,
+		losses:         losses,
+		serverStats:    protocol.StatsRequested(response.Header),
+		connDone:       make(chan struct{}),
+		udpDisabled:    !authResponse.UDPEnabled,
+		udpConnMap:     make(map[uint32]*udpPacketConn),
 	}
 	if !c.udpDisabled {
 		go c.loopMessages(conn)
@@ -812,8 +830,14 @@ type clientOffer struct {
 }
 
 type clientQUICConnection struct {
-	quicConn     *quic.Conn
-	rawConn      io.Closer
+	id             uint64
+	quicConn       *quic.Conn
+	rawConn        io.Closer
+	http3Transport http.RoundTripper
+	losses         *lossCounter
+	// serverStats is set when the server answered the auth request with the
+	// statistics header, which is the only case where asking it is safe.
+	serverStats  bool
 	closeOnce    sync.Once
 	connDone     chan struct{}
 	connErr      error

@@ -9,9 +9,11 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/quic-go/quicvarint"
 	qtls "github.com/sagernet/sing-quic"
@@ -266,9 +268,19 @@ type serverSession[U comparable] struct {
 	authUser      U
 	udpAccess     sync.RWMutex
 	udpConnMap    map[uint32]*udpPacketConn
+
+	// statsEnabled is set when the client asked for statistics on the auth
+	// request. Only such a client is ever told the endpoint exists, and every
+	// other request for it is answered like any unknown path.
+	statsEnabled atomic.Bool
+	losses       atomic.Pointer[lossCounter]
 }
 
 func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && r.Host == protocol.URLHost && r.URL.Path == protocol.URLPathStats && s.authenticated && s.statsEnabled.Load() {
+		s.serveStats(w)
+		return
+	}
 	if r.Method == http.MethodPost && r.Host == protocol.URLHost && r.URL.Path == protocol.URLPath {
 		if s.authenticated {
 			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
@@ -276,6 +288,9 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				Rx:         s.receiveBPS,
 				RxAuto:     s.receiveBPS == 0 && s.ignoreClientBandwidth,
 			})
+			if s.statsEnabled.Load() {
+				protocol.SetStatsRequested(w.Header())
+			}
 			w.WriteHeader(protocol.StatusAuthOK)
 			return
 		}
@@ -297,9 +312,9 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if s.sendBPS > 0 && rx > s.sendBPS {
 				rx = s.sendBPS
 			}
-			s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(rx, s.quicConn.InitialPacketSize(), s.brutalDebug, s.logger))
+			s.setCongestionControl(hyCC.NewBrutalSender(rx, s.quicConn.InitialPacketSize(), s.brutalDebug, s.logger))
 		} else {
-			s.quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
+			s.setCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
 				s.quicConn.InitialPacketSize(),
 				s.bbrProfile,
 			))
@@ -310,6 +325,10 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Rx:         s.receiveBPS,
 			RxAuto:     rxAuto,
 		})
+		if protocol.StatsRequested(r.Header) {
+			s.statsEnabled.Store(true)
+			protocol.SetStatsRequested(w.Header())
+		}
 		w.WriteHeader(protocol.StatusAuthOK)
 		if s.ctx.Done() != nil {
 			go func() {
@@ -326,6 +345,24 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		s.masqueradeHandler.ServeHTTP(w, r)
 	}
+}
+
+// setCongestionControl installs cc with loss counting, which the statistics
+// endpoint reports.
+func (s *serverSession[U]) setCongestionControl(cc congestion.CongestionControl) {
+	cc, losses := countLosses(cc)
+	s.losses.Store(losses)
+	s.quicConn.SetCongestionControl(cc)
+}
+
+// serveStats reports the server's view of this connection as the sender of
+// downstream traffic.
+func (s *serverSession[U]) serveStats(w http.ResponseWriter) {
+	stats := connectionStats(0, s.quicConn, s.losses.Load())
+	protocol.SetStatsPadding(w.Header())
+	w.Header().Set("Content-Type", "application/x-www-form-urlencoded")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, encodeTransportStats(stats))
 }
 
 func (s *serverSession[U]) dispatchStream(frameType http3.FrameType, stream *quic.Stream, err error) (bool, error) {
