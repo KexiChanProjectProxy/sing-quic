@@ -8,6 +8,7 @@ import (
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/congestion"
+	"github.com/sagernet/quic-go/monotime"
 )
 
 // TransportStats is one side's view of a hysteria2 connection, as a sender.
@@ -19,8 +20,10 @@ type TransportStats struct {
 	ConnectionID uint64
 	SmoothedRTT  time.Duration
 	RTTVariance  time.Duration
-	// PacketsSent counts every packet put on the wire, including those that
-	// were later declared lost.
+	// PacketsSent counts the ack-eliciting packets put on the wire, including
+	// those later declared lost. Packets that carry only acknowledgements are
+	// left out, because they can never be declared lost and would otherwise
+	// dilute the loss rate of whichever side mostly receives.
 	PacketsSent uint64
 	PacketsLost uint64
 	BytesSent   uint64
@@ -33,6 +36,7 @@ type TransportStats struct {
 // hysteria2 always installs Brutal or BBR in its place, so without this the
 // connection statistics report no loss at all.
 type lossCounter struct {
+	sent atomic.Uint64
 	lost atomic.Uint64
 }
 
@@ -52,6 +56,13 @@ type countingController struct {
 	counter *lossCounter
 }
 
+func (c *countingController) OnPacketSent(sentTime monotime.Time, bytesInFlight congestion.ByteCount, packetNumber congestion.PacketNumber, bytes congestion.ByteCount, isRetransmittable bool) {
+	if isRetransmittable {
+		c.counter.sent.Add(1)
+	}
+	c.CongestionControl.OnPacketSent(sentTime, bytesInFlight, packetNumber, bytes, isRetransmittable)
+}
+
 func (c *countingController) OnCongestionEvent(number congestion.PacketNumber, lostBytes congestion.ByteCount, priorInFlight congestion.ByteCount) {
 	// quic-go reports each lost packet through OnCongestionEvent, whether or
 	// not the controller is extended. A zero loss is an ECN congestion signal.
@@ -64,6 +75,13 @@ func (c *countingController) OnCongestionEvent(number congestion.PacketNumber, l
 type countingControllerEx struct {
 	congestion.CongestionControlEx
 	counter *lossCounter
+}
+
+func (c *countingControllerEx) OnPacketSent(sentTime monotime.Time, bytesInFlight congestion.ByteCount, packetNumber congestion.PacketNumber, bytes congestion.ByteCount, isRetransmittable bool) {
+	if isRetransmittable {
+		c.counter.sent.Add(1)
+	}
+	c.CongestionControlEx.OnPacketSent(sentTime, bytesInFlight, packetNumber, bytes, isRetransmittable)
 }
 
 func (c *countingControllerEx) OnCongestionEvent(number congestion.PacketNumber, lostBytes congestion.ByteCount, priorInFlight congestion.ByteCount) {
@@ -79,10 +97,12 @@ func connectionStats(id uint64, conn *quic.Conn, counter *lossCounter) Transport
 		ConnectionID: id,
 		SmoothedRTT:  stats.SmoothedRTT,
 		RTTVariance:  stats.MeanDeviation,
-		PacketsSent:  stats.PacketsSent,
 		BytesSent:    stats.BytesSent,
 	}
 	if counter != nil {
+		// Both counts cover the same packets: ack-eliciting ones sent after the
+		// controller was installed, which are the only ones reported lost.
+		result.PacketsSent = counter.sent.Load()
 		result.PacketsLost = counter.lost.Load()
 	}
 	return result

@@ -56,7 +56,11 @@ func (c *Client) LocalStats() (TransportStats, bool) {
 // request fails.
 //
 // A failure never tears down or replaces the connection: the request only ever
-// uses the connection that is already open.
+// uses the connection that is already open. After a request fails for any
+// reason but its own deadline, the HTTP/3 transport drops its handle on the
+// connection and later requests fail until the next connection. The handle
+// cannot be rebuilt in place, because HTTP/3 allows a single control stream per
+// connection.
 func (c *Client) ServerStats(ctx context.Context) (TransportStats, bool) {
 	conn := c.activeConnection()
 	if conn == nil || !conn.serverStats {
