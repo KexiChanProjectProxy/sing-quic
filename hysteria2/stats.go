@@ -25,6 +25,9 @@ type TransportStats struct {
 	// left out, because they can never be declared lost and would otherwise
 	// dilute the loss rate of whichever side mostly receives.
 	PacketsSent uint64
+	// PacketsLost counts the packets reported lost to the congestion
+	// controller. Losses found only by the probe timeout are not reported, so
+	// it undercounts on connections that carry little traffic.
 	PacketsLost uint64
 	BytesSent   uint64
 }
@@ -100,8 +103,13 @@ func connectionStats(id uint64, conn *quic.Conn, counter *lossCounter) Transport
 		BytesSent:    stats.BytesSent,
 	}
 	if counter != nil {
-		// Both counts cover the same packets: ack-eliciting ones sent after the
-		// controller was installed, which are the only ones reported lost.
+		// Both counts cover ack-eliciting packets sent after the controller was
+		// installed, which are the only ones ever reported lost. They still
+		// differ at the edges: a loss found by the probe timeout is retransmitted
+		// without being reported to the controller, so it is missing from the
+		// lost count while the probe that replaced it is counted as sent. That
+		// matters for a connection carrying only keepalives, whose losses are
+		// mostly found that way, and is small under real traffic.
 		result.PacketsSent = counter.sent.Load()
 		result.PacketsLost = counter.lost.Load()
 	}
